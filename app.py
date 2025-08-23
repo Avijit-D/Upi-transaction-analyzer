@@ -4,9 +4,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from bs4 import BeautifulSoup
 import re
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 import plotly.express as px
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 
 def parse_html_to_dataframe(file_content):
     soup = BeautifulSoup(file_content, 'html.parser')
@@ -54,27 +60,198 @@ def parse_html_to_dataframe(file_content):
     df['Amount'] = df['Amount'].str.replace(',', '').astype(float)
     return df
 
-def amount_based_clustering(df, k=3):
+def optimal_k_means(X, max_k=20):
+    best_k = 2
+    best_score = -1
+    for k in range(2, min(len(X), max_k) + 1):
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        labels = kmeans.fit_predict(X)
+        score = silhouette_score(X, labels)
+        if score > best_score:
+            best_score = score
+            best_k = k
+    final_model = KMeans(n_clusters=best_k, random_state=42)
+    final_labels = final_model.fit_predict(X)
+    return final_labels, best_k
+
+def amount_based_clustering_auto(df):
     df = df.copy()
     df['Log Amount'] = np.log1p(df['Amount'])
     X = df['Log Amount'].values.reshape(-1, 1)
-    kmeans = KMeans(n_clusters=k, random_state=42)
-    df['Amount Cluster'] = kmeans.fit_predict(X)
-    return df
+    labels, best_k = optimal_k_means(X)
+    df['Amount Cluster'] = [f'Group {i+1}' for i in labels]
+    return df, best_k
 
 def plot_amount_clusters(df):
-    fig = px.violin(
+    # Violin plot
+    fig1 = px.violin(
         df,
         x='Amount Cluster',
         y='Amount',
         box=True,
         points='all',
         color='Amount Cluster',
-        title='Transaction Amount Distribution per Cluster',
-        labels={'Amount Cluster': 'Cluster', 'Amount': 'Amount (₹)'}
+        title='Transaction Amount Groups',
+        labels={'Amount Cluster': 'Group', 'Amount': 'Amount (₹)'}
     )
-    fig.update_layout(width=800, height=500)
+    fig1.update_layout(width=800, height=500)
+    
+    # Scatter plot
+    fig2 = px.scatter(
+        df,
+        x='Date',
+        y='Amount',
+        color='Amount Cluster',
+        title='Transaction Distribution Over Time',
+        labels={'Amount': 'Amount (₹)', 'Date': 'Date', 'Amount Cluster': 'Group'},
+        hover_data=['Transaction Type', 'Payee']
+    )
+    fig2.update_layout(width=800, height=500)
+    fig2.update_traces(marker=dict(size=8))
+    
+    return fig1, fig2
+
+def extract_temporal_features(df):
+    df = df.copy()
+    # Extract hour from time
+    df['Hour'] = df['Time'].dt.hour
+    
+    # Extract weekday and month
+    df['Weekday'] = df['Date'].dt.day_name()
+    df['Month'] = df['Date'].dt.month_name()
+    
+    return df
+
+def encode_transaction_features(df):
+    df = df.copy()
+    
+    # One-hot encode transaction type
+    df = pd.get_dummies(df, columns=['Transaction Type'], prefix='Type')
+    
+    # Frequency encode payee
+    payee_freq = df['Payee'].value_counts(normalize=True)
+    df['Payee_Frequency'] = df['Payee'].map(payee_freq)
+    
+    # Group rare payees
+    payee_counts = df['Payee'].value_counts()
+    rare_payees = payee_counts[payee_counts < 3].index
+    df['Payee_Grouped'] = df['Payee'].replace(rare_payees, 'Others')
+    
+    # Label encode account
+    le = LabelEncoder()
+    df['Account_Encoded'] = le.fit_transform(df['Account'].fillna('Unknown'))
+    
+    # Extract keywords from payee
+    vectorizer = CountVectorizer(max_features=10, stop_words='english')
+    payee_keywords = vectorizer.fit_transform(df['Payee_Grouped'].fillna('Unknown'))
+    keywords_df = pd.DataFrame(payee_keywords.toarray(), 
+                             columns=[f'Keyword_{i}' for i in range(payee_keywords.shape[1])])
+    df = pd.concat([df, keywords_df], axis=1)
+    
+    return df
+
+def calculate_frequency_features(df):
+    df = df.copy()
+    
+    # Calculate transaction frequency with same payee
+    df['Payee_Frequency_Count'] = df.groupby('Payee')['Payee'].transform('count')
+    
+    # Calculate transaction frequency with same account
+    df['Account_Frequency_Count'] = df.groupby('Account')['Account'].transform('count')
+    
+    return df
+
+def prepare_feature_matrix(df):
+    # Select features for clustering
+    features = [
+        'Hour',
+        'Payee_Frequency',
+        'Account_Encoded',
+        'Payee_Frequency_Count',
+        'Account_Frequency_Count'
+    ] + [col for col in df.columns if col.startswith('Type_')] + \
+       [col for col in df.columns if col.startswith('Keyword_')]
+    
+    X = df[features].copy()
+    
+    # Fill NaN values with appropriate defaults
+    X = X.fillna({
+        'Hour': X['Hour'].median(),
+        'Payee_Frequency': 0,
+        'Account_Encoded': 0,
+        'Payee_Frequency_Count': 1,
+        'Account_Frequency_Count': 1
+    })
+    
+    # Fill NaN values in keyword columns with 0
+    keyword_cols = [col for col in X.columns if col.startswith('Keyword_')]
+    X[keyword_cols] = X[keyword_cols].fillna(0)
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    return X_scaled
+
+def optimal_k_means_behavioral(X, max_k=20):
+    best_k = 2
+    best_score = -1
+    for k in range(2, min(len(X), max_k) + 1):
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        labels = kmeans.fit_predict(X)
+        score = silhouette_score(X, labels)
+        if score > best_score:
+            best_score = score
+            best_k = k
+    final_model = KMeans(n_clusters=best_k, random_state=42)
+    final_labels = final_model.fit_predict(X)
+    return final_labels, best_k
+
+def plot_behavioral_clusters(df, X):
+    # Reduce dimensionality for visualization
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X)
+    
+    # Create DataFrame for plotting
+    plot_df = pd.DataFrame({
+        'PC1': X_pca[:, 0],
+        'PC2': X_pca[:, 1],
+        'Behavior Group': df['Behavior Group'],
+        'Amount': df['Amount'],
+        'Payee': df['Payee'],
+        'Transaction Type': df['Transaction Type'].str.split('_').str[-1]
+    })
+    
+    # Create scatter plot
+    fig = px.scatter(
+        plot_df,
+        x='PC1',
+        y='PC2',
+        color='Behavior Group',
+        size='Amount',
+        hover_data=['Payee', 'Transaction Type', 'Amount'],
+        title='Behavioral Clusters (PCA Reduced)',
+        labels={'PC1': 'Principal Component 1', 'PC2': 'Principal Component 2'}
+    )
+    fig.update_layout(width=800, height=600)
     return fig
+
+def behavioral_clustering(df):
+    df = df.copy()
+    
+    # Extract and engineer features
+    df = extract_temporal_features(df)
+    df = encode_transaction_features(df)
+    df = calculate_frequency_features(df)
+    
+    # Prepare feature matrix
+    X = prepare_feature_matrix(df)
+    
+    # Find optimal clusters
+    labels, num_groups = optimal_k_means_behavioral(X)
+    df['Behavior Group'] = [f'Group {i+1}' for i in labels]
+    
+    return df, num_groups, X
 
 # Set page config
 st.set_page_config(
@@ -216,120 +393,38 @@ if uploaded_file is not None:
             st.info("No transactions found matching your search criteria.")
     else:
         st.info("Enter a search term to find specific transactions.")
-
-    # Amount-based clustering on filtered data
-    st.subheader("Transaction Amount Clustering")
+    
+    # Amount-based clustering with automatic k determination
+    st.subheader("Transaction Amount Groups")
     
     # Apply clustering to filtered data
-    df_filtered = amount_based_clustering(df_filtered)
+    df_filtered, num_groups = amount_based_clustering_auto(df_filtered)
     
-    # Sort clusters by mean amount
-    cluster_means = df_filtered.groupby('Amount Cluster')['Amount'].mean().sort_values()
-    cluster_mapping = {old: new for new, old in enumerate(cluster_means.index)}
-    df_filtered['Amount Cluster'] = df_filtered['Amount Cluster'].map(cluster_mapping)
+    # Display number of groups found
+    st.write(f"Automatically determined {num_groups} transaction groups based on amount patterns")
     
-    # Create cluster labels based on amount ranges
-    cluster_stats = df_filtered.groupby('Amount Cluster')['Amount'].agg(['min', 'max', 'mean']).round(2)
-    cluster_labels = {
-        0: f"Small (₹{cluster_stats.loc[0, 'min']:,.2f} - ₹{cluster_stats.loc[0, 'max']:,.2f})",
-        1: f"Medium (₹{cluster_stats.loc[1, 'min']:,.2f} - ₹{cluster_stats.loc[1, 'max']:,.2f})",
-        2: f"Large (₹{cluster_stats.loc[2, 'min']:,.2f} - ₹{cluster_stats.loc[2, 'max']:,.2f})"
-    }
-    df_filtered['Cluster Label'] = df_filtered['Amount Cluster'].map(cluster_labels)
+    # Calculate and display group statistics
+    group_stats = df_filtered.groupby('Amount Cluster')['Amount'].agg(['min', 'max', 'mean', 'count']).round(2)
+    group_stats.columns = ['Minimum Amount', 'Maximum Amount', 'Average Amount', 'Transaction Count']
     
-    # Display cluster statistics
-    st.write("Cluster Statistics:")
-    st.dataframe(cluster_stats.style.format({
-        'min': '₹{:.2f}',
-        'max': '₹{:.2f}',
-        'mean': '₹{:.2f}'
+    st.write("Group Statistics:")
+    st.dataframe(group_stats.style.format({
+        'Minimum Amount': '₹{:.2f}',
+        'Maximum Amount': '₹{:.2f}',
+        'Average Amount': '₹{:.2f}'
     }))
     
+    # Interactive cluster visualizations
+    violin_fig, scatter_fig = plot_amount_clusters(df_filtered)
+    
     # Create tabs for different visualizations
-    tab1, tab2 = st.tabs(["Matplotlib Visualization", "Plotly Visualization"])
+    tab1, tab2 = st.tabs(["Distribution Analysis", "Time Series Analysis"])
     
     with tab1:
-        # Matplotlib visualization
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Box plot
-        df_filtered.boxplot(column='Amount', by='Cluster Label', ax=ax1)
-        ax1.set_title('Transaction Amount Distribution by Cluster')
-        ax1.set_xlabel('Cluster')
-        ax1.set_ylabel('Amount (₹)')
-        ax1.tick_params(axis='x', rotation=45)
-        
-        # Bar chart of transaction counts
-        cluster_counts = df_filtered['Cluster Label'].value_counts()
-        cluster_counts.plot(kind='bar', ax=ax2)
-        ax2.set_title('Number of Transactions per Cluster')
-        ax2.set_xlabel('Cluster')
-        ax2.set_ylabel('Number of Transactions')
-        ax2.tick_params(axis='x', rotation=45)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
+        st.plotly_chart(violin_fig, use_container_width=True)
     
     with tab2:
-        # Plotly visualization
-        fig = plot_amount_clusters(df_filtered)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Top Payees and Recipients Analysis
-    st.subheader("Top Payees and Recipients")
-    
-    # Create tabs for different analyses
-    tab1, tab2 = st.tabs(["By Transaction Count", "By Total Amount"])
-    
-    with tab1:
-        # Top payees by transaction count
-        top_payees_count = df_filtered[df_filtered['Transaction Type'].isin(['Paid', 'Sent'])].groupby('Payee').agg(
-            Transaction_Count=('Amount', 'count'),
-            Total_Amount=('Amount', 'sum')
-        ).sort_values('Transaction_Count', ascending=False).head(10)
-        
-        # Top recipients by transaction count
-        top_recipients_count = df_filtered[df_filtered['Transaction Type'] == 'Received'].groupby('Payee').agg(
-            Transaction_Count=('Amount', 'count'),
-            Total_Amount=('Amount', 'sum')
-        ).sort_values('Transaction_Count', ascending=False).head(10)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("Top Payees by Transaction Count")
-            st.dataframe(top_payees_count.style.format({
-                'Total_Amount': '₹{:.2f}'
-            }))
-        with col2:
-            st.write("Top Recipients by Transaction Count")
-            st.dataframe(top_recipients_count.style.format({
-                'Total_Amount': '₹{:.2f}'
-            }))
-    
-    with tab2:
-        # Top payees by total amount
-        top_payees_amount = df_filtered[df_filtered['Transaction Type'].isin(['Paid', 'Sent'])].groupby('Payee').agg(
-            Transaction_Count=('Amount', 'count'),
-            Total_Amount=('Amount', 'sum')
-        ).sort_values('Total_Amount', ascending=False).head(10)
-        
-        # Top recipients by total amount
-        top_recipients_amount = df_filtered[df_filtered['Transaction Type'] == 'Received'].groupby('Payee').agg(
-            Transaction_Count=('Amount', 'count'),
-            Total_Amount=('Amount', 'sum')
-        ).sort_values('Total_Amount', ascending=False).head(10)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("Top Payees by Total Amount")
-            st.dataframe(top_payees_amount.style.format({
-                'Total_Amount': '₹{:.2f}'
-            }))
-        with col2:
-            st.write("Top Recipients by Total Amount")
-            st.dataframe(top_recipients_amount.style.format({
-                'Total_Amount': '₹{:.2f}'
-            }))
+        st.plotly_chart(scatter_fig, use_container_width=True)
     
     # Transaction Value Trends
     st.subheader("Transaction Value Trends")
@@ -391,6 +486,115 @@ if uploaded_file is not None:
         ax2.plot(monthly_amounts['Month'], monthly_amounts['Average_Amount'], color='red')
         ax2.set_ylabel('Average Amount per Transaction (₹)')
         st.pyplot(fig)
+    
+    # Top Transactions Analysis
+    st.subheader("Top Transactions Analysis")
+    
+    # Create tabs for different analyses
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Most Paid To",
+        "Most Received From",
+        "Highest Transactions",
+        "Most Frequent Transactions"
+    ])
+    
+    with tab1:
+        st.write("Top 10 Payees by Total Amount Paid")
+        paid_df = df_filtered[df_filtered['Transaction Type'].isin(['Paid', 'Sent'])]
+        top_paid = paid_df.groupby('Payee').agg({
+            'Amount': ['sum', 'count'],
+            'Transaction Type': 'first'
+        }).round(2)
+        top_paid.columns = ['Total Amount', 'Transaction Count', 'Type']
+        top_paid = top_paid.sort_values('Total Amount', ascending=False).head(10)
+        st.dataframe(
+            top_paid.style.format({
+                'Total Amount': '₹{:.2f}'
+            }),
+            use_container_width=True
+        )
+    
+    with tab2:
+        st.write("Top 10 Recipients by Total Amount Received")
+        received_df = df_filtered[df_filtered['Transaction Type'] == 'Received']
+        top_received = received_df.groupby('Payee').agg({
+            'Amount': ['sum', 'count'],
+            'Transaction Type': 'first'
+        }).round(2)
+        top_received.columns = ['Total Amount', 'Transaction Count', 'Type']
+        top_received = top_received.sort_values('Total Amount', ascending=False).head(10)
+        st.dataframe(
+            top_received.style.format({
+                'Total Amount': '₹{:.2f}'
+            }),
+            use_container_width=True
+        )
+    
+    with tab3:
+        st.write("Top 10 Highest Value Transactions")
+        highest_transactions = df_filtered.sort_values('Amount', ascending=False).head(10)
+        display_df = highest_transactions[['Date', 'Time', 'Transaction Type', 'Payee', 'Amount']].copy()
+        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+        display_df['Time'] = display_df['Time'].dt.strftime('%H:%M:%S')
+        display_df['Amount'] = display_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    with tab4:
+        st.write("Top 10 Most Frequent Transactions")
+        frequent_transactions = df_filtered.groupby(['Payee', 'Transaction Type']).agg({
+            'Amount': ['count', 'sum', 'mean']
+        }).round(2)
+        frequent_transactions.columns = ['Transaction Count', 'Total Amount', 'Average Amount']
+        frequent_transactions = frequent_transactions.sort_values('Transaction Count', ascending=False).head(10)
+        st.dataframe(
+            frequent_transactions.style.format({
+                'Total Amount': '₹{:.2f}',
+                'Average Amount': '₹{:.2f}'
+            }),
+            use_container_width=True
+        )
+    
+    # Behavioral Clustering Analysis
+    st.subheader("Behavioral Clustering Analysis")
+    
+    # Check if we have enough data for behavioral clustering
+    if len(df_filtered) >= 10:  # Need at least 10 transactions for meaningful clustering
+        # Apply behavioral clustering
+        df_behavioral, num_behavioral_groups, X_behavioral = behavioral_clustering(df_filtered)
+        
+        st.write(f"Automatically determined {num_behavioral_groups} behavioral groups based on transaction patterns")
+        
+        # Display behavioral group statistics
+        behavioral_stats = df_behavioral.groupby('Behavior Group').agg({
+            'Amount': ['count', 'sum', 'mean'],
+            'Payee': 'nunique',
+            'Transaction Type': lambda x: x.mode().iloc[0] if not x.mode().empty else 'N/A'
+        }).round(2)
+        behavioral_stats.columns = ['Transaction Count', 'Total Amount', 'Average Amount', 'Unique Payees', 'Most Common Type']
+        
+        st.write("Behavioral Group Statistics:")
+        st.dataframe(behavioral_stats.style.format({
+            'Total Amount': '₹{:.2f}',
+            'Average Amount': '₹{:.2f}'
+        }))
+        
+        # Create behavioral clustering visualization
+        behavioral_fig = plot_behavioral_clusters(df_behavioral, X_behavioral)
+        st.plotly_chart(behavioral_fig, use_container_width=True)
+        
+        # Show sample transactions from each behavioral group
+        st.write("Sample Transactions by Behavioral Group:")
+        for group in sorted(df_behavioral['Behavior Group'].unique()):
+            group_transactions = df_behavioral[df_behavioral['Behavior Group'] == group].head(5)
+            st.write(f"**{group}:**")
+            display_df = group_transactions[['Date', 'Time', 'Transaction Type', 'Payee', 'Amount']].copy()
+            display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+            display_df['Time'] = display_df['Time'].dt.strftime('%H:%M:%S')
+            display_df['Amount'] = display_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.write("---")
+    else:
+        st.info("Need at least 10 transactions for behavioral clustering analysis.")
     
     # Visualization selection
     st.subheader("Number of Transactions")
