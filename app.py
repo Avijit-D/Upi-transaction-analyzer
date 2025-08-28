@@ -13,6 +13,155 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from fuzzywuzzy import fuzz, process
+import unicodedata
+
+def normalize_text(text):
+    """
+    Normalize text by converting to lowercase, removing punctuation and special characters,
+    and keeping only alphabetic characters and spaces.
+    """
+    if pd.isna(text) or text == 'N/A':
+        return text
+    
+    # Convert to string and lowercase
+    text = str(text).lower()
+    
+    # Remove punctuation and special characters, keep only letters and spaces
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    
+    # Remove extra spaces and normalize unicode
+    text = ' '.join(text.split())
+    text = unicodedata.normalize('NFKD', text)
+    
+    return text
+
+def identify_categorical_columns(df):
+    """
+    Identify columns that contain categorical names/entities.
+    """
+    categorical_cols = []
+    
+    for col in df.columns:
+        # Check if column contains text data
+        if df[col].dtype == 'object':
+            # Sample some values to check if they look like names/entities
+            sample_values = df[col].dropna().head(100)
+            if len(sample_values) > 0:
+                # Check if most values contain alphabetic characters
+                alpha_ratio = sum(1 for val in sample_values if re.search(r'[a-zA-Z]', str(val))) / len(sample_values)
+                if alpha_ratio > 0.7:  # If more than 70% contain letters
+                    categorical_cols.append(col)
+    
+    return categorical_cols
+
+def fuzzy_group_similar_values(values, similarity_threshold=85):
+    """
+    Group similar values using fuzzy matching.
+    
+    Args:
+        values: List of unique values to group
+        similarity_threshold: Minimum similarity score (0-100) to consider values as similar
+    
+    Returns:
+        tuple: (value_mapping, similarity_examples)
+    """
+    if len(values) <= 1:
+        return {val: val for val in values}, []
+    
+    # Normalize all values
+    normalized_values = {val: normalize_text(val) for val in values}
+    
+    # Create mapping from original values to representative names
+    value_mapping = {}
+    processed_values = set()
+    similarity_examples = []
+    
+    for original_val in values:
+        if original_val in processed_values:
+            continue
+            
+        normalized_val = normalized_values[original_val]
+        similar_values = [original_val]
+        
+        # Find similar values
+        for other_val in values:
+            if other_val != original_val and other_val not in processed_values:
+                other_normalized = normalized_values[other_val]
+                
+                # Use different fuzzy matching strategies
+                ratio = fuzz.ratio(normalized_val, other_normalized)
+                partial_ratio = fuzz.partial_ratio(normalized_val, other_normalized)
+                token_sort_ratio = fuzz.token_sort_ratio(normalized_val, other_normalized)
+                token_set_ratio = fuzz.token_set_ratio(normalized_val, other_normalized)
+                
+                # Take the maximum similarity score
+                max_similarity = max(ratio, partial_ratio, token_sort_ratio, token_set_ratio)
+                
+                if max_similarity >= similarity_threshold:
+                    similar_values.append(other_val)
+                    # Store example with similarity score
+                    if len(similarity_examples) < 5:  # Limit examples
+                        similarity_examples.append({
+                            'value1': original_val,
+                            'value2': other_val,
+                            'similarity': max_similarity,
+                            'algorithm': 'max'
+                        })
+        
+        # Choose representative name (first encountered or most common)
+        representative = similar_values[0]
+        
+        # Map all similar values to the representative
+        for val in similar_values:
+            value_mapping[val] = representative
+            processed_values.add(val)
+    
+    return value_mapping, similarity_examples
+
+def apply_fuzzy_normalization(df, similarity_threshold=85):
+    """
+    Apply fuzzy normalization to categorical columns in the dataset.
+    
+    Args:
+        df: DataFrame to normalize
+        similarity_threshold: Minimum similarity score for grouping (0-100)
+    
+    Returns:
+        tuple: (normalized DataFrame, normalization details)
+    """
+    df = df.copy()
+    normalization_details = {}
+    
+    # Identify categorical columns
+    categorical_cols = identify_categorical_columns(df)
+    
+    if not categorical_cols:
+        return df, normalization_details
+    
+    # Apply normalization to each categorical column
+    for col in categorical_cols:
+        if col in df.columns:
+            # Get unique values
+            unique_values = df[col].dropna().unique()
+            
+            if len(unique_values) > 1:
+                # Create mapping for this column
+                value_mapping, similarity_examples = fuzzy_group_similar_values(unique_values, similarity_threshold)
+                
+                # Apply mapping
+                df[col] = df[col].map(value_mapping).fillna(df[col])
+                
+                # Store normalization details
+                normalization_details[col] = {
+                    'original_count': len(unique_values),
+                    'normalized_count': len(df[col].dropna().unique()),
+                    'reduction': len(unique_values) - len(df[col].dropna().unique()),
+                    'groupings': value_mapping,
+                    'similarity_examples': similarity_examples
+                }
+    
+    return df, normalization_details
 
 def parse_html_to_dataframe(file_content):
     soup = BeautifulSoup(file_content, 'html.parser')
@@ -264,6 +413,9 @@ st.set_page_config(
 st.title("Google Pay Transaction Analysis")
 st.write("Upload your Google Pay activity HTML file to analyze your transaction patterns.")
 
+# Add a placeholder for normalization stats
+normalization_stats_placeholder = st.empty()
+
 # File uploader
 uploaded_file = st.file_uploader("Choose a Google Pay activity HTML file", type=['html'])
 
@@ -280,6 +432,64 @@ if uploaded_file is not None:
     df['Day'] = df['Date'].dt.day
     df['Month'] = df['Date'].dt.month
     df['Week'] = df['Date'].dt.isocalendar().week
+    
+    # Apply fuzzy normalization to categorical fields
+    with st.spinner("Processing and normalizing data..."):
+        df, normalization_details = apply_fuzzy_normalization(df, 85)  # Default threshold
+    
+    # Update normalization statistics
+    if normalization_details:
+        total_original = sum(details['original_count'] for details in normalization_details.values())
+        total_normalized = sum(details['normalized_count'] for details in normalization_details.values())
+        total_reduction = total_original - total_normalized
+        
+        if total_reduction > 0:
+            normalization_stats_placeholder.success(
+                f"**Normalization Results:**\n"
+                f"Reduced from {total_original} to {total_normalized} unique values\n"
+                f"({total_reduction} values grouped)"
+            )
+        else:
+            normalization_stats_placeholder.info("No values were grouped during normalization")
+    else:
+        normalization_stats_placeholder.info("No categorical columns processed")
+    
+    # Display normalization results in an expander
+    with st.expander("View Normalization Details", expanded=False):
+        st.write("**Normalization Summary:**")
+        
+        if normalization_details:
+            for col, details in normalization_details.items():
+                if details['reduction'] > 0:
+                    st.write(f"- **{col}**: Reduced from {details['original_count']} to {details['normalized_count']} unique values ({details['reduction']} values grouped)")
+                    
+                    # Show some example groupings
+                    if details['groupings']:
+                        st.write(f"  **Example groupings in {col}:**")
+                        # Show first few groupings as examples
+                        example_count = 0
+                        for original, representative in details['groupings'].items():
+                            if original != representative and example_count < 3:
+                                st.write(f"    '{original}' → '{representative}'")
+                                example_count += 1
+                        if example_count == 0:
+                            st.write("    No values were grouped together.")
+                        
+                        # Show similarity examples with scores
+                        if 'similarity_examples' in details and details['similarity_examples']:
+                            st.write(f"  **Similarity examples (threshold: 85%):**")
+                            for example in details['similarity_examples'][:3]:  # Show first 3
+                                st.write(f"    '{example['value1']}' ↔ '{example['value2']}' (similarity: {example['similarity']:.1f}%)")
+                else:
+                    st.write(f"- **{col}**: No similar values found to group")
+        else:
+            st.write("No categorical columns were processed for normalization.")
+        
+        st.write("**Note:** Similar names, merchants, and payees have been grouped together to improve analysis accuracy.")
+        st.write("Examples of what gets grouped:")
+        st.write("- 'Amazon Pay', 'amazonpay', 'AMZN Pay' → 'Amazon Pay'")
+        st.write("- 'John Doe', 'john doe', 'JOHN DOE' → 'John Doe'")
+        st.write("- 'Uber', 'UBER', 'uber' → 'Uber'")
     
     # Display basic information
     st.subheader("Data Overview")
@@ -319,6 +529,17 @@ if uploaded_file is not None:
     
     # Filter data based on amount range
     df_filtered = df[(df['Amount'] >= min_amount) & (df['Amount'] <= max_amount)]
+    
+    # Fuzzy normalization settings
+    st.subheader("Fuzzy Normalization Settings")
+    fuzzy_similarity_threshold = st.slider(
+        "Similarity Threshold (%)",
+        min_value=70,
+        max_value=95,
+        value=85,
+        step=5,
+        help="Minimum similarity score to group similar names/entities. Higher values = stricter grouping."
+    )
     
     # Payee Selection
     st.subheader("Transaction Details")
@@ -553,48 +774,6 @@ if uploaded_file is not None:
             }),
             use_container_width=True
         )
-    
-    # Behavioral Clustering Analysis
-    st.subheader("Behavioral Clustering Analysis")
-    
-    # Check if we have enough data for behavioral clustering
-    if len(df_filtered) >= 10:  # Need at least 10 transactions for meaningful clustering
-        # Apply behavioral clustering
-        df_behavioral, num_behavioral_groups, X_behavioral = behavioral_clustering(df_filtered)
-        
-        st.write(f"Automatically determined {num_behavioral_groups} behavioral groups based on transaction patterns")
-        
-        # Display behavioral group statistics
-        behavioral_stats = df_behavioral.groupby('Behavior Group').agg({
-            'Amount': ['count', 'sum', 'mean'],
-            'Payee': 'nunique',
-            'Transaction Type': lambda x: x.mode().iloc[0] if not x.mode().empty else 'N/A'
-        }).round(2)
-        behavioral_stats.columns = ['Transaction Count', 'Total Amount', 'Average Amount', 'Unique Payees', 'Most Common Type']
-        
-        st.write("Behavioral Group Statistics:")
-        st.dataframe(behavioral_stats.style.format({
-            'Total Amount': '₹{:.2f}',
-            'Average Amount': '₹{:.2f}'
-        }))
-        
-        # Create behavioral clustering visualization
-        behavioral_fig = plot_behavioral_clusters(df_behavioral, X_behavioral)
-        st.plotly_chart(behavioral_fig, use_container_width=True)
-        
-        # Show sample transactions from each behavioral group
-        st.write("Sample Transactions by Behavioral Group:")
-        for group in sorted(df_behavioral['Behavior Group'].unique()):
-            group_transactions = df_behavioral[df_behavioral['Behavior Group'] == group].head(5)
-            st.write(f"**{group}:**")
-            display_df = group_transactions[['Date', 'Time', 'Transaction Type', 'Payee', 'Amount']].copy()
-            display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
-            display_df['Time'] = display_df['Time'].dt.strftime('%H:%M:%S')
-            display_df['Amount'] = display_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-            st.write("---")
-    else:
-        st.info("Need at least 10 transactions for behavioral clustering analysis.")
     
     # Visualization selection
     st.subheader("Number of Transactions")
